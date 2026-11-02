@@ -1,7 +1,7 @@
 # sourse-submit
 作成してきたプログラムの一例(研究で使用したものや学会発表で使用したプログラムは載せていないです)
 
-Gesture_Volume_Control.py: 人差し指と親指の先端距離でPCの音量調整を行うプログラム
+Gesture_Volume_Control.py: PCの音量調整を人差し指と親指の先端距離で行うプログラム
 
 demo_classify.py: 発した音声が人間である確率をリアルタイムで出力するプログラム
 
