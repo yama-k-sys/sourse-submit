@@ -1,0 +1,922 @@
+import cv2
+import time
+import csv
+import json
+import hashlib
+import shutil
+from pathlib import Path
+from datetime import datetime
+
+import mediapipe as mp
+import numpy as np
+
+
+# ==================================================
+# 基本設定
+# ==================================================
+
+GOPRO_CAMERA_NAME = "GoPro Webcam"
+
+CAMERA_INDEX = 2
+
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
+TARGET_FPS = 30
+
+USE_MIRROR_DISPLAY = False
+
+# CSV保存間隔
+# 1なら毎フレーム保存、2なら2フレームに1回保存
+SAVE_EVERY_N_FRAMES = 1
+
+# AprilTagの実寸
+# 5cmなら0.05、7cmなら0.07
+TAG_SIZE_M = 0.083
+CALIBRATION_PATH = Path(__file__).resolve().parent / "calibration.npz"
+# Display-only candidate. Verify by raising your real left hand in the meeting.
+SWAP_HAND_LABELS_FOR_DISPLAY = True
+# Saves unannotated JPEGs with frame/time ledger for short verification recordings.
+SAVE_RAW_FRAMES = True
+
+# AprilTagファミリー
+APRILTAG_DICT = cv2.aruco.DICT_APRILTAG_36h11
+
+
+# ==================================================
+# 出力CSV設定
+# ==================================================
+output_dir = Path(__file__).resolve().parent / "output_csv_v2"
+output_dir.mkdir(exist_ok=True)
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+output_dir = output_dir / timestamp
+output_dir.mkdir()
+if USE_MIRROR_DISPLAY:
+    raise RuntimeError("Use unmirrored input with the saved camera calibration.")
+if not CALIBRATION_PATH.is_file():
+    raise RuntimeError("Missing calibration.npz. Complete calibration and copy its result beside this script first.")
+
+hand_csv_path = output_dir / f"hand_landmarks_{timestamp}.csv"
+tag_csv_path = output_dir / f"apriltag_{timestamp}.csv"
+pose_csv_path = output_dir / f"pose_arm_landmarks_{timestamp}.csv"
+arm_feature_csv_path = output_dir / f"arm_features_{timestamp}.csv"
+
+
+# ==================================================
+# OpenCVのAprilTag機能が利用できるか確認
+# ==================================================
+if not hasattr(cv2, "aruco"):
+    raise RuntimeError(
+        "cv2.aruco が見つかりません。\n"
+        "pip install opencv-contrib-python を実行してください。"
+    )
+
+
+# ==================================================
+# GoPro Webcamを開く関数
+# ==================================================
+def setup_camera_properties(cap):
+    """
+    カメラ設定。
+    """
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+
+    # 遅延を減らすための設定
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+
+
+def open_gopro_camera():
+
+    candidates = [
+        ("GoPro name + CAP_DSHOW", f"video={GOPRO_CAMERA_NAME}", cv2.CAP_DSHOW),
+        ("GoPro index + CAP_DSHOW", CAMERA_INDEX, cv2.CAP_DSHOW),
+        ("GoPro index + DEFAULT", CAMERA_INDEX, None),
+    ]
+
+    for label, source, backend in candidates:
+        print(f"カメラ接続テスト中: {label}")
+
+        if backend is None:
+            cap = cv2.VideoCapture(source)
+        else:
+            cap = cv2.VideoCapture(source, backend)
+
+        if not cap.isOpened():
+            print("  -> 開けませんでした")
+            cap.release()
+            continue
+
+        setup_camera_properties(cap)
+
+        # 数フレーム読んで確認
+        ok = False
+        test_frame = None
+
+        for _ in range(20):
+            ret, frame = cap.read()
+            if ret and frame is not None and frame.size > 0:
+                ok = True
+                test_frame = frame
+                break
+            time.sleep(0.05)
+
+        if ok:
+            h, w = test_frame.shape[:2]
+            print(f"  -> 使用可能: {label}, size={w}x{h}")
+            return cap
+        else:
+            print("  -> 開けたが映像を取得できませんでした")
+            cap.release()
+
+    return None
+
+
+# ==================================================
+# MediaPipe Hands / Pose の設定
+# ==================================================
+mp_hands = mp.solutions.hands
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
+mp_styles = mp.solutions.drawing_styles
+
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=2,
+    model_complexity=1,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.6
+)
+
+# 顔は使わず、腕・肩・肘・手首を取るために Pose を追加
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=1,
+    enable_segmentation=False,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.6
+)
+
+FINGER_TIPS = {
+    4: "Thumb",
+    8: "Index",
+    12: "Middle",
+    16: "Ring",
+    20: "Pinky"
+}
+
+# MediaPipe Poseのうち、腕の分析で使う点
+POSE_ARM_POINTS = {
+    11: "LeftShoulder",
+    12: "RightShoulder",
+    13: "LeftElbow",
+    14: "RightElbow",
+    15: "LeftWrist",
+    16: "RightWrist"
+}
+
+# 描画用の腕の接続
+ARM_CONNECTIONS = [
+    (11, 13),  # 左肩 - 左肘
+    (13, 15),  # 左肘 - 左手首
+    (12, 14),  # 右肩 - 右肘
+    (14, 16),  # 右肘 - 右手首
+    (11, 12),  # 左肩 - 右肩
+]
+
+
+# ==================================================
+# AprilTag の設定
+# ==================================================
+april_dictionary = cv2.aruco.getPredefinedDictionary(APRILTAG_DICT)
+
+if hasattr(cv2.aruco, "DetectorParameters"):
+    april_parameters = cv2.aruco.DetectorParameters()
+else:
+    april_parameters = cv2.aruco.DetectorParameters_create()
+
+
+def set_aruco_param(params, name, value):
+    if hasattr(params, name):
+        setattr(params, name, value)
+
+
+# AprilTag検出の安定化用パラメータ
+set_aruco_param(april_parameters, "cornerRefinementMethod", cv2.aruco.CORNER_REFINE_SUBPIX)
+set_aruco_param(april_parameters, "adaptiveThreshWinSizeMin", 3)
+set_aruco_param(april_parameters, "adaptiveThreshWinSizeMax", 53)
+set_aruco_param(april_parameters, "adaptiveThreshWinSizeStep", 10)
+set_aruco_param(april_parameters, "minMarkerPerimeterRate", 0.02)
+set_aruco_param(april_parameters, "maxMarkerPerimeterRate", 4.0)
+
+# AprilTag用パラメータが存在するOpenCVでは設定
+set_aruco_param(april_parameters, "aprilTagQuadDecimate", 1.0)
+set_aruco_param(april_parameters, "aprilTagQuadSigma", 0.0)
+set_aruco_param(april_parameters, "aprilTagMinClusterPixels", 5)
+set_aruco_param(april_parameters, "aprilTagMaxNmaxima", 10)
+
+
+if hasattr(cv2.aruco, "ArucoDetector"):
+    april_detector = cv2.aruco.ArucoDetector(
+        april_dictionary,
+        april_parameters
+    )
+
+    def detect_apriltags(gray_image):
+        return april_detector.detectMarkers(gray_image)
+
+else:
+    def detect_apriltags(gray_image):
+        return cv2.aruco.detectMarkers(
+            gray_image,
+            april_dictionary,
+            parameters=april_parameters
+        )
+
+
+# ==================================================
+# 角度計算用関数
+# ==================================================
+def to_np3(point):
+    return np.array([point.x, point.y, point.z], dtype=np.float32)
+
+
+def calc_angle_deg(a, b, c):
+    """
+    3点 a-b-c の角度を計算する。
+    bを中心とした角度。
+    """
+    ba = a - b
+    bc = c - b
+
+    norm_ba = np.linalg.norm(ba)
+    norm_bc = np.linalg.norm(bc)
+
+    if norm_ba < 1e-8 or norm_bc < 1e-8:
+        return ""
+
+    cos_angle = np.dot(ba, bc) / (norm_ba * norm_bc)
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
+def calc_vector_angle_xy_deg(p1, p2, image_width, image_height):
+    """
+    画像平面上で、p1 -> p2 のベクトルが水平方向に対して何度傾いているか。
+    右方向が0度、下方向が正になる。
+    """
+    dx = (p2.x - p1.x) * image_width
+    dy = (p2.y - p1.y) * image_height
+
+    if abs(dx) < 1e-8 and abs(dy) < 1e-8:
+        return ""
+
+    return float(np.degrees(np.arctan2(dy, dx)))
+
+
+def get_landmark(landmarks, idx):
+    if landmarks is None:
+        return None
+    return landmarks.landmark[idx]
+
+
+# ==================================================
+# カメラ設定
+# ==================================================
+cap = open_gopro_camera()
+
+if cap is None:
+    print("GoPro Webcamを開けませんでした。")
+    print("確認してください。")
+    print("1. Zoom、Teams、OBS、カメラアプリを完全に閉じる")
+    print("2. GoPro Webcamアプリ側でGoProが接続済みになっているか確認する")
+    print("3. GOPRO_CAMERA_NAME が DirectShow の名前と一致しているか確認する")
+    print("4. それでもだめなら CAMERA_INDEX を 0, 1, 2, 3 に変更する")
+    raise SystemExit
+
+
+# ==================================================
+# カメラ内部パラメータ
+# ==================================================
+ret, test_frame = cap.read()
+
+if not ret:
+    print("カメラ画像を取得できませんでした。")
+    raise SystemExit
+
+image_h, image_w = test_frame.shape[:2]
+
+# 実際に取得できた解像度を表示
+print(f"実際の入力解像度: {image_w}x{image_h}")
+
+# Load calibration for this exact output resolution. FOV/crop must also match.
+with np.load(CALIBRATION_PATH, allow_pickle=False) as calibration:
+    camera_matrix = np.asarray(calibration["camera_matrix"], dtype=np.float64)
+    dist_coeffs = np.asarray(calibration["dist_coeffs"], dtype=np.float64)
+    calibrated_size = tuple(int(v) for v in calibration["image_size"])
+if calibrated_size != (image_w, image_h):
+    cap.release()
+    raise RuntimeError(f"Calibration size {calibrated_size} != camera size {(image_w,image_h)}")
+if camera_matrix.shape != (3,3) or not np.isfinite(camera_matrix).all() or not np.isfinite(dist_coeffs).all():
+    cap.release()
+    raise RuntimeError("Invalid calibration arrays")
+settings_note = input("GoPro model / Webcam FOV / zoom / tag placement notes: ").strip()
+metadata = {
+    "schema_version": 2,
+    "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    "calibration_sha256": hashlib.sha256(CALIBRATION_PATH.read_bytes()).hexdigest(),
+    "camera_matrix": camera_matrix.tolist(), "dist_coeffs": dist_coeffs.tolist(),
+    "image_size": [image_w,image_h], "tag_size_m": TAG_SIZE_M,
+    "dictionary": "DICT_APRILTAG_36h11", "max_num_hands": 2,
+    "mirror_before_detection": False,
+    "display_swap_candidate": SWAP_HAND_LABELS_FOR_DISPLAY,
+    "handedness_csv": "raw MediaPipe label; candidate stored separately",
+    "clock": "perf_counter after cap.read, before inference; not sensor exposure timestamp",
+    "created_local": datetime.now().astimezone().isoformat(),
+    "opencv_version": cv2.__version__, "mediapipe_version": mp.__version__,
+    "raw_frames": SAVE_RAW_FRAMES, "settings_note": settings_note
+}
+(output_dir / "session_metadata.json").write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding="utf-8")
+shutil.copyfile(CALIBRATION_PATH, output_dir / "calibration_used.npz")
+raw_dir = output_dir / "raw_frames"
+if SAVE_RAW_FRAMES:
+    raw_dir.mkdir()
+frame_log_file = open(output_dir / "frame_log.csv", "w", newline="", encoding="utf-8")
+frame_log_writer = csv.writer(frame_log_file)
+frame_log_writer.writerow(["frame","time_sec","hand_count","pose_detected","tag_count","raw_image"])
+
+
+# ==================================================
+# CSVファイル準備
+# ==================================================
+hand_file = open(hand_csv_path, "w", newline="", encoding="utf-8")
+tag_file = open(tag_csv_path, "w", newline="", encoding="utf-8")
+pose_file = open(pose_csv_path, "w", newline="", encoding="utf-8")
+arm_feature_file = open(arm_feature_csv_path, "w", newline="", encoding="utf-8")
+
+hand_writer = csv.writer(hand_file)
+tag_writer = csv.writer(tag_file)
+pose_writer = csv.writer(pose_file)
+arm_feature_writer = csv.writer(arm_feature_file)
+
+hand_writer.writerow([
+    "frame",
+    "time_sec",
+    "hand_index",
+    "handedness",
+    "hand_score",
+    "landmark_id",
+    "x_norm",
+    "y_norm",
+    "z_norm",
+    "x_px",
+    "y_px",
+    "world_x",
+    "world_y",
+    "world_z",
+    "handedness_candidate"
+])
+
+tag_writer.writerow([
+    "frame",
+    "time_sec",
+    "tag_id",
+    "center_x_px",
+    "center_y_px",
+    "corner0_x",
+    "corner0_y",
+    "corner1_x",
+    "corner1_y",
+    "corner2_x",
+    "corner2_y",
+    "corner3_x",
+    "corner3_y",
+    "rvec_x",
+    "rvec_y",
+    "rvec_z",
+    "tvec_x_m",
+    "tvec_y_m",
+    "tvec_z_m"
+])
+
+pose_writer.writerow([
+    "frame",
+    "time_sec",
+    "landmark_id",
+    "landmark_name",
+    "x_norm",
+    "y_norm",
+    "z_norm",
+    "visibility",
+    "x_px",
+    "y_px",
+    "world_x",
+    "world_y",
+    "world_z"
+])
+
+arm_feature_writer.writerow([
+    "frame",
+    "time_sec",
+    "left_upper_arm_angle_xy_deg",
+    "left_forearm_angle_xy_deg",
+    "right_upper_arm_angle_xy_deg",
+    "right_forearm_angle_xy_deg",
+    "left_elbow_angle_world_deg",
+    "right_elbow_angle_world_deg",
+    "left_shoulder_visibility",
+    "left_elbow_visibility",
+    "left_wrist_visibility",
+    "right_shoulder_visibility",
+    "right_elbow_visibility",
+    "right_wrist_visibility"
+])
+
+
+# ==================================================
+# メインループ
+# ==================================================
+prev_time = 0
+frame_count = 0
+start_time = time.perf_counter()
+
+print("MediaPipe Hand + Pose Arm + AprilTag detection started.")
+print(f"手座標CSV: {hand_csv_path}")
+print(f"AprilTag CSV: {tag_csv_path}")
+print(f"腕ランドマークCSV: {pose_csv_path}")
+print(f"腕特徴量CSV: {arm_feature_csv_path}")
+print("終了するには q キーを押してください。")
+
+try:
+    while True:
+        ret, frame = cap.read()
+
+        if not ret:
+            print("フレームを取得できませんでした。")
+            break
+
+        frame_count += 1
+        elapsed_time = time.perf_counter() - start_time
+
+        if USE_MIRROR_DISPLAY:
+            frame = cv2.flip(frame, 1)
+
+        h, w, _ = frame.shape
+        if (w,h) != calibrated_size:
+            raise RuntimeError("Camera resolution changed during recording.")
+
+        should_save = (frame_count % SAVE_EVERY_N_FRAMES == 0)
+        raw_image_name = ""
+        if should_save and SAVE_RAW_FRAMES:
+            raw_image_name = f"raw_frames/frame_{frame_count:06d}.jpg"
+            if not cv2.imwrite(str(output_dir / raw_image_name), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+                raise RuntimeError("Failed to save raw frame")
+
+        # ==================================================
+        # MediaPipeによる手・姿勢の検出
+        # ==================================================
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        rgb_frame.flags.writeable = False
+        hand_results = hands.process(rgb_frame)
+        pose_results = pose.process(rgb_frame)
+        rgb_frame.flags.writeable = True
+
+        # ==================================================
+        # AprilTagの検出
+        # ==================================================
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        tag_corners, tag_ids, rejected_candidates = detect_apriltags(
+            gray_frame
+        )
+
+        # ==================================================
+        # Poseの腕ランドマークを描画・CSV保存
+        # ==================================================
+        if pose_results.pose_landmarks:
+            pose_lms = pose_results.pose_landmarks
+            pose_world_lms = pose_results.pose_world_landmarks
+
+            # 肩・肘・手首のみ描画
+            for a, b in ARM_CONNECTIONS:
+                lm_a = pose_lms.landmark[a]
+                lm_b = pose_lms.landmark[b]
+
+                ax = int(lm_a.x * w)
+                ay = int(lm_a.y * h)
+                bx = int(lm_b.x * w)
+                by = int(lm_b.y * h)
+
+                cv2.line(
+                    frame,
+                    (ax, ay),
+                    (bx, by),
+                    (255, 128, 0),
+                    3
+                )
+
+            for lm_id, lm_name in POSE_ARM_POINTS.items():
+                lm = pose_lms.landmark[lm_id]
+
+                x_px = int(lm.x * w)
+                y_px = int(lm.y * h)
+
+                cv2.circle(frame, (x_px, y_px), 7, (255, 128, 0), -1)
+                cv2.putText(
+                    frame,
+                    lm_name,
+                    (x_px + 8, y_px - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 128, 0),
+                    2
+                )
+
+                if should_save:
+                    world_x = ""
+                    world_y = ""
+                    world_z = ""
+
+                    if pose_world_lms:
+                        wlm = pose_world_lms.landmark[lm_id]
+                        world_x = wlm.x
+                        world_y = wlm.y
+                        world_z = wlm.z
+
+                    pose_writer.writerow([
+                        frame_count,
+                        elapsed_time,
+                        lm_id,
+                        lm_name,
+                        lm.x,
+                        lm.y,
+                        lm.z,
+                        lm.visibility,
+                        x_px,
+                        y_px,
+                        world_x,
+                        world_y,
+                        world_z
+                    ])
+
+            # 腕の傾き・肘角度を保存
+            if should_save:
+                l_shoulder = get_landmark(pose_lms, 11)
+                r_shoulder = get_landmark(pose_lms, 12)
+                l_elbow = get_landmark(pose_lms, 13)
+                r_elbow = get_landmark(pose_lms, 14)
+                l_wrist = get_landmark(pose_lms, 15)
+                r_wrist = get_landmark(pose_lms, 16)
+
+                left_upper_arm_angle_xy = calc_vector_angle_xy_deg(l_shoulder, l_elbow, w, h)
+                left_forearm_angle_xy = calc_vector_angle_xy_deg(l_elbow, l_wrist, w, h)
+                right_upper_arm_angle_xy = calc_vector_angle_xy_deg(r_shoulder, r_elbow, w, h)
+                right_forearm_angle_xy = calc_vector_angle_xy_deg(r_elbow, r_wrist, w, h)
+
+                left_elbow_angle_world = ""
+                right_elbow_angle_world = ""
+
+                if pose_world_lms:
+                    wl_shoulder = to_np3(pose_world_lms.landmark[11])
+                    wr_shoulder = to_np3(pose_world_lms.landmark[12])
+                    wl_elbow = to_np3(pose_world_lms.landmark[13])
+                    wr_elbow = to_np3(pose_world_lms.landmark[14])
+                    wl_wrist = to_np3(pose_world_lms.landmark[15])
+                    wr_wrist = to_np3(pose_world_lms.landmark[16])
+
+                    left_elbow_angle_world = calc_angle_deg(wl_shoulder, wl_elbow, wl_wrist)
+                    right_elbow_angle_world = calc_angle_deg(wr_shoulder, wr_elbow, wr_wrist)
+
+                arm_feature_writer.writerow([
+                    frame_count,
+                    elapsed_time,
+                    left_upper_arm_angle_xy,
+                    left_forearm_angle_xy,
+                    right_upper_arm_angle_xy,
+                    right_forearm_angle_xy,
+                    left_elbow_angle_world,
+                    right_elbow_angle_world,
+                    l_shoulder.visibility,
+                    l_elbow.visibility,
+                    l_wrist.visibility,
+                    r_shoulder.visibility,
+                    r_elbow.visibility,
+                    r_wrist.visibility
+                ])
+
+        # ==================================================
+        # 手の検出結果を描画・CSV保存
+        # ==================================================
+        if hand_results.multi_hand_landmarks:
+            for hand_id, hand_landmarks in enumerate(
+                hand_results.multi_hand_landmarks
+            ):
+
+                handedness = "Unknown"
+                hand_score = ""
+
+                if hand_results.multi_handedness:
+                    handedness_result = hand_results.multi_handedness[hand_id]
+                    handedness = handedness_result.classification[0].label
+                    hand_score = handedness_result.classification[0].score
+
+                handedness_candidate = handedness
+                if SWAP_HAND_LABELS_FOR_DISPLAY:
+                    handedness_candidate = {"Left":"Right", "Right":"Left"}.get(handedness, handedness)
+
+                world_landmarks = None
+                if hand_results.multi_hand_world_landmarks:
+                    world_landmarks = hand_results.multi_hand_world_landmarks[hand_id]
+
+                mp_drawing.draw_landmarks(
+                    frame,
+                    hand_landmarks,
+                    mp_hands.HAND_CONNECTIONS,
+                    mp_styles.get_default_hand_landmarks_style(),
+                    mp_styles.get_default_hand_connections_style()
+                )
+
+                if should_save:
+                    for lm_id, lm in enumerate(hand_landmarks.landmark):
+                        x_px = int(lm.x * w)
+                        y_px = int(lm.y * h)
+
+                        world_x = ""
+                        world_y = ""
+                        world_z = ""
+
+                        if world_landmarks is not None:
+                            wlm = world_landmarks.landmark[lm_id]
+                            world_x = wlm.x
+                            world_y = wlm.y
+                            world_z = wlm.z
+
+                        hand_writer.writerow([
+                            frame_count,
+                            elapsed_time,
+                            hand_id,
+                            handedness,
+                            hand_score,
+                            lm_id,
+                            lm.x,
+                            lm.y,
+                            lm.z,
+                            x_px,
+                            y_px,
+                            world_x,
+                            world_y,
+                            world_z,
+                            handedness_candidate
+                        ])
+
+                for lm_id, finger_name in FINGER_TIPS.items():
+                    lm = hand_landmarks.landmark[lm_id]
+
+                    cx = int(lm.x * w)
+                    cy = int(lm.y * h)
+
+                    cv2.circle(
+                        frame,
+                        (cx, cy),
+                        8,
+                        (0, 255, 255),
+                        -1
+                    )
+
+                    cv2.putText(
+                        frame,
+                        finger_name,
+                        (cx + 10, cy - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 255),
+                        2
+                    )
+
+                wrist = hand_landmarks.landmark[0]
+
+                wx = int(wrist.x * w)
+                wy = int(wrist.y * h)
+
+                cv2.circle(
+                    frame,
+                    (wx, wy),
+                    8,
+                    (255, 0, 255),
+                    -1
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Hand {hand_id + 1} {handedness_candidate} (raw {handedness})",
+                    (wx + 10, wy + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 0, 255),
+                    2
+                )
+
+        # ==================================================
+        # AprilTagの検出結果を描画・CSV保存
+        # ==================================================
+        tag_count = 0
+
+        if tag_ids is not None and len(tag_ids) > 0:
+            tag_count = len(tag_ids)
+
+            cv2.aruco.drawDetectedMarkers(
+                frame,
+                tag_corners,
+                tag_ids
+            )
+
+            rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
+                tag_corners,
+                TAG_SIZE_M,
+                camera_matrix,
+                dist_coeffs
+            )
+
+            for i, tag_id in enumerate(tag_ids.flatten()):
+                corners = tag_corners[i]
+                points_float = corners.reshape(4, 2)
+                points = points_float.astype(int)
+
+                top_left = points[0]
+                center_x = float(np.mean(points_float[:, 0]))
+                center_y = float(np.mean(points_float[:, 1]))
+
+                rvec = rvecs[i][0]
+                tvec = tvecs[i][0]
+
+                cv2.drawFrameAxes(
+                    frame,
+                    camera_matrix,
+                    dist_coeffs,
+                    rvec,
+                    tvec,
+                    TAG_SIZE_M * 0.5
+                )
+
+                if should_save:
+                    tag_writer.writerow([
+                        frame_count,
+                        elapsed_time,
+                        int(tag_id),
+                        center_x,
+                        center_y,
+                        float(points_float[0][0]),
+                        float(points_float[0][1]),
+                        float(points_float[1][0]),
+                        float(points_float[1][1]),
+                        float(points_float[2][0]),
+                        float(points_float[2][1]),
+                        float(points_float[3][0]),
+                        float(points_float[3][1]),
+                        float(rvec[0]),
+                        float(rvec[1]),
+                        float(rvec[2]),
+                        float(tvec[0]),
+                        float(tvec[1]),
+                        float(tvec[2])
+                    ])
+
+                cv2.circle(
+                    frame,
+                    (int(center_x), int(center_y)),
+                    7,
+                    (0, 0, 255),
+                    -1
+                )
+
+                cv2.putText(
+                    frame,
+                    f"AprilTag ID: {tag_id}",
+                    (top_left[0], top_left[1] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Center: ({int(center_x)}, {int(center_y)})",
+                    (int(center_x) + 10, int(center_y) + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 0, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Z: {tvec[2]:.2f} m",
+                    (int(center_x) + 10, int(center_y) + 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 0, 255),
+                    2
+                )
+
+        # ==================================================
+        # FPS計算
+        # ==================================================
+        if should_save:
+            frame_log_writer.writerow([frame_count, elapsed_time,
+                len(hand_results.multi_hand_landmarks or []),
+                int(pose_results.pose_landmarks is not None), tag_count, raw_image_name])
+        current_time = time.perf_counter()
+
+        if prev_time != 0:
+            fps = 1 / (current_time - prev_time)
+        else:
+            fps = 0
+
+        prev_time = current_time
+
+        # ==================================================
+        # 画面表示
+        # ==================================================
+        cv2.putText(
+            frame,
+            f"FPS: {fps:.1f}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 0),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            f"AprilTags: {tag_count}",
+            (20, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            f"Frame: {frame_count}",
+            (20, 120),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            "Press q to quit",
+            (20, 160),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2
+        )
+
+        cv2.imshow(
+            "GoPro Hand + Pose Arm + AprilTag Detection",
+            frame
+        )
+
+        if frame_count % 30 == 0:
+            frame_log_file.flush()
+            hand_file.flush()
+            tag_file.flush()
+            pose_file.flush()
+            arm_feature_file.flush()
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+finally:
+    frame_log_file.flush()
+    frame_log_file.close()
+    hand_file.flush()
+    tag_file.flush()
+    pose_file.flush()
+    arm_feature_file.flush()
+
+    hand_file.close()
+    tag_file.close()
+    pose_file.close()
+    arm_feature_file.close()
+
+    cap.release()
+    hands.close()
+    pose.close()
+    cv2.destroyAllWindows()
+
+    print("終了しました。")
+    print(f"手座標CSV: {hand_csv_path}")
+    print(f"AprilTag CSV: {tag_csv_path}")
+    print(f"腕ランドマークCSV: {pose_csv_path}")
+    print(f"腕特徴量CSV: {arm_feature_csv_path}")
